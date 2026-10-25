@@ -1,0 +1,444 @@
+name: Build mod
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: 8.1.1
+
+      - name: Create project files
+        run: |
+          mkdir -p src/main/java/com/holycross src/main/resources src/main/resources/META-INF src/main/resources/assets/holycross/lang src/main/resources/assets/holycross/models/item src/main/resources/assets/holycross/textures/item src/main/resources/data/holycross/advancements/recipes/tools src/main/resources/data/holycross/recipes src/main/resources/data/holycross/tags/entity_types
+          cat > build.gradle <<'HC_EOF_7Q'
+          plugins {
+              id 'eclipse'
+              id 'idea'
+              id 'net.minecraftforge.gradle' version '[6.0,6.2)'
+          }
+
+          version = mod_version
+          group = mod_group_id
+
+          base {
+              archivesName = mod_id
+          }
+
+          java.toolchain.languageVersion = JavaLanguageVersion.of(17)
+
+          minecraft {
+              mappings channel: mapping_channel, version: mapping_version
+              copyIdeResources = true
+
+              runs {
+                  configureEach {
+                      workingDirectory project.file('run')
+                      property 'forge.logging.markers', 'REGISTRIES'
+                      property 'forge.logging.console.level', 'debug'
+                      mods {
+                          "${mod_id}" {
+                              source sourceSets.main
+                          }
+                      }
+                  }
+                  client { }
+                  server {
+                      args '--nogui'
+                  }
+              }
+          }
+
+          dependencies {
+              minecraft "net.minecraftforge:forge:${minecraft_version}-${forge_version}"
+          }
+
+          tasks.named('jar', Jar).configure {
+              manifest.attributes([
+                  'Specification-Title'   : mod_id,
+                  'Implementation-Title'  : project.name,
+                  'Implementation-Version': project.jar.archiveVersion
+              ])
+              finalizedBy 'reobfJar'
+          }
+
+          tasks.withType(JavaCompile).configureEach {
+              options.encoding = 'UTF-8'
+          }
+          HC_EOF_7Q
+          cat > gradle.properties <<'HC_EOF_7Q'
+          org.gradle.jvmargs=-Xmx3G
+          org.gradle.daemon=false
+
+          minecraft_version=1.20.1
+          forge_version=47.2.0
+          mapping_channel=official
+          mapping_version=1.20.1
+
+          mod_id=holycross
+          mod_version=1.0.0
+          mod_group_id=com.holycross
+          HC_EOF_7Q
+          cat > settings.gradle <<'HC_EOF_7Q'
+          pluginManagement {
+              repositories {
+                  gradlePluginPortal()
+                  maven {
+                      name = 'MinecraftForge'
+                      url = 'https://maven.minecraftforge.net/'
+                  }
+              }
+          }
+
+          rootProject.name = 'holycross'
+          HC_EOF_7Q
+          cat > src/main/java/com/holycross/HolyCrossItem.java <<'HC_EOF_7Q'
+          package com.holycross;
+
+          import java.util.List;
+          import javax.annotation.Nullable;
+
+          import net.minecraft.ChatFormatting;
+          import net.minecraft.core.particles.ParticleTypes;
+          import net.minecraft.network.chat.Component;
+          import net.minecraft.server.level.ServerLevel;
+          import net.minecraft.sounds.SoundEvents;
+          import net.minecraft.sounds.SoundSource;
+          import net.minecraft.stats.Stats;
+          import net.minecraft.world.InteractionHand;
+          import net.minecraft.world.InteractionResultHolder;
+          import net.minecraft.world.effect.MobEffectInstance;
+          import net.minecraft.world.effect.MobEffects;
+          import net.minecraft.world.entity.Mob;
+          import net.minecraft.world.entity.MobType;
+          import net.minecraft.world.entity.player.Player;
+          import net.minecraft.world.item.Item;
+          import net.minecraft.world.item.ItemStack;
+          import net.minecraft.world.item.Rarity;
+          import net.minecraft.world.item.TooltipFlag;
+          import net.minecraft.world.item.UseAnim;
+          import net.minecraft.world.level.Level;
+          import net.minecraft.world.phys.AABB;
+
+          public class HolyCrossItem extends Item {
+
+              // ----- Настройки (правятся прямо здесь) -----
+              /** Радиус действия, в блоках. */
+              public static final double RADIUS = 8.0D;
+              /** Перезарядка: 10 секунд = 200 тиков. */
+              public static final int COOLDOWN_TICKS = 200;
+              /** Сила отбрасывания обычных мобов и нежити. */
+              public static final float KNOCKBACK = 0.5F;
+              public static final float UNDEAD_KNOCKBACK = 1.0F;
+              /** Замедление (Slowness II на 5 сек). */
+              public static final int SLOWNESS_TICKS = 100;
+              public static final int SLOWNESS_AMPLIFIER = 1;
+              /** Слабость для нежити (10 сек). */
+              public static final int WEAKNESS_TICKS = 200;
+              /** Длительность анимации вытянутой руки, в тиках. */
+              public static final int ANIMATION_TICKS = 10;
+
+              private static final int PARTICLES_PER_RING = 32;
+              private static final int RINGS = 2;
+
+              public HolyCrossItem() {
+                  super(new Item.Properties()
+                          .stacksTo(1)
+                          .rarity(Rarity.RARE)); // голубой (aqua) цвет названия; без прочности
+              }
+
+              @Override
+              public UseAnim getUseAnimation(ItemStack stack) {
+                  return UseAnim.BOW; // руки вытягиваются вперёд, как при натягивании лука
+              }
+
+              @Override
+              public int getUseDuration(ItemStack stack) {
+                  return ANIMATION_TICKS;
+              }
+
+              @Override
+              public InteractionResultHolder<ItemStack> use(Level level, Player player, InteractionHand hand) {
+                  ItemStack stack = player.getItemInHand(hand);
+
+                  if (player.getCooldowns().isOnCooldown(this)) {
+                      return InteractionResultHolder.fail(stack);
+                  }
+
+                  // Анимация — только визуальное сопровождение, эффект срабатывает сразу.
+                  player.startUsingItem(hand);
+
+                  if (level instanceof ServerLevel serverLevel) {
+                      player.getCooldowns().addCooldown(this, COOLDOWN_TICKS);
+                      player.awardStat(Stats.ITEM_USED.get(this));
+
+                      serverLevel.playSound(null, player.getX(), player.getY(), player.getZ(),
+                              SoundEvents.BELL_BLOCK, SoundSource.PLAYERS, 1.5F, 0.6F);
+                      spawnLightWave(serverLevel, player);
+                      repelMobs(serverLevel, player);
+                  }
+
+                  return InteractionResultHolder.consume(stack);
+              }
+
+              private static void repelMobs(ServerLevel level, Player player) {
+                  double radiusSqr = RADIUS * RADIUS;
+                  AABB area = player.getBoundingBox().inflate(RADIUS);
+
+                  List<Mob> mobs = level.getEntitiesOfClass(Mob.class, area, mob ->
+                          mob.isAlive()
+                                  && !mob.getType().is(ModTags.CROSS_IMMUNE)
+                                  && mob.distanceToSqr(player) <= radiusSqr);
+
+                  for (Mob mob : mobs) {
+                      boolean undead = mob.getMobType() == MobType.UNDEAD;
+
+                      // Направление «к игроку»: knockback() сам толкает в противоположную сторону.
+                      double dx = player.getX() - mob.getX();
+                      double dz = player.getZ() - mob.getZ();
+                      while (dx * dx + dz * dz < 1.0E-4D) {
+                          dx = (level.random.nextDouble() - level.random.nextDouble()) * 0.01D;
+                          dz = (level.random.nextDouble() - level.random.nextDouble()) * 0.01D;
+                      }
+
+                      mob.knockback(undead ? UNDEAD_KNOCKBACK : KNOCKBACK, dx, dz);
+                      mob.hurtMarked = true; // синхронизировать скорость с клиентами
+
+                      mob.addEffect(new MobEffectInstance(
+                              MobEffects.MOVEMENT_SLOWDOWN, SLOWNESS_TICKS, SLOWNESS_AMPLIFIER));
+                      if (undead) {
+                          mob.addEffect(new MobEffectInstance(MobEffects.WEAKNESS, WEAKNESS_TICKS, 0));
+                      }
+                  }
+              }
+
+              /** Кольца светящихся частиц, расходящиеся от игрока наружу. */
+              private static void spawnLightWave(ServerLevel level, Player player) {
+                  for (int ring = 0; ring < RINGS; ring++) {
+                      double y = player.getY() + 0.15D + ring * 0.8D;
+                      for (int i = 0; i < PARTICLES_PER_RING; i++) {
+                          double angle = (Math.PI * 2.0D) * i / PARTICLES_PER_RING;
+                          double dirX = Math.cos(angle);
+                          double dirZ = Math.sin(angle);
+                          // count = 0: смещения трактуются как направление, speed — как скорость
+                          level.sendParticles(ParticleTypes.END_ROD,
+                                  player.getX() + dirX * 0.8D, y, player.getZ() + dirZ * 0.8D,
+                                  0, dirX, 0.0D, dirZ, 0.6D);
+                      }
+                  }
+              }
+
+              @Override
+              public void appendHoverText(ItemStack stack, @Nullable Level level,
+                                          List<Component> tooltip, TooltipFlag flag) {
+                  tooltip.add(Component.translatable("item.holycross.holy_cross.desc")
+                          .withStyle(ChatFormatting.GRAY));
+              }
+          }
+          HC_EOF_7Q
+          cat > src/main/java/com/holycross/HolyCrossMod.java <<'HC_EOF_7Q'
+          package com.holycross;
+
+          import net.minecraft.world.item.CreativeModeTabs;
+          import net.minecraftforge.event.BuildCreativeModeTabContentsEvent;
+          import net.minecraftforge.eventbus.api.IEventBus;
+          import net.minecraftforge.fml.common.Mod;
+          import net.minecraftforge.fml.javafmlmod.FMLJavaModLoadingContext;
+
+          @Mod(HolyCrossMod.MOD_ID)
+          public class HolyCrossMod {
+              public static final String MOD_ID = "holycross";
+
+              public HolyCrossMod() {
+                  IEventBus modBus = FMLJavaModLoadingContext.get().getModEventBus();
+                  ModItems.ITEMS.register(modBus);
+                  modBus.addListener(this::addToCreativeTab);
+              }
+
+              private void addToCreativeTab(BuildCreativeModeTabContentsEvent event) {
+                  if (event.getTabKey() == CreativeModeTabs.TOOLS_AND_UTILITIES) {
+                      event.accept(ModItems.HOLY_CROSS);
+                  }
+              }
+          }
+          HC_EOF_7Q
+          cat > src/main/java/com/holycross/ModItems.java <<'HC_EOF_7Q'
+          package com.holycross;
+
+          import net.minecraft.world.item.Item;
+          import net.minecraftforge.registries.DeferredRegister;
+          import net.minecraftforge.registries.ForgeRegistries;
+          import net.minecraftforge.registries.RegistryObject;
+
+          public final class ModItems {
+              public static final DeferredRegister<Item> ITEMS =
+                      DeferredRegister.create(ForgeRegistries.ITEMS, HolyCrossMod.MOD_ID);
+
+              public static final RegistryObject<Item> HOLY_CROSS =
+                      ITEMS.register("holy_cross", HolyCrossItem::new);
+
+              private ModItems() {
+              }
+          }
+          HC_EOF_7Q
+          cat > src/main/java/com/holycross/ModTags.java <<'HC_EOF_7Q'
+          package com.holycross;
+
+          import net.minecraft.core.registries.Registries;
+          import net.minecraft.resources.ResourceLocation;
+          import net.minecraft.tags.TagKey;
+          import net.minecraft.world.entity.EntityType;
+
+          public final class ModTags {
+              /**
+               * Сущности из этого тега крест не отпугивает (например, боссы из других модов).
+               * По умолчанию тег пуст: data/holycross/tags/entity_types/cross_immune.json
+               */
+              public static final TagKey<EntityType<?>> CROSS_IMMUNE = TagKey.create(
+                      Registries.ENTITY_TYPE, new ResourceLocation(HolyCrossMod.MOD_ID, "cross_immune"));
+
+              private ModTags() {
+              }
+          }
+          HC_EOF_7Q
+          cat > src/main/resources/pack.mcmeta <<'HC_EOF_7Q'
+          {
+            "pack": {
+              "description": "Holy Cross resources",
+              "pack_format": 15
+            }
+          }
+          HC_EOF_7Q
+          cat > src/main/resources/META-INF/mods.toml <<'HC_EOF_7Q'
+          modLoader="javafml"
+          loaderVersion="[47,)"
+          license="MIT"
+
+          [[mods]]
+          modId="holycross"
+          version="1.0.0"
+          displayName="Holy Cross (Крест Света)"
+          description='''
+          Adds the Cross of Light: right-click to repel nearby mobs with a wave of light.
+          Undead are pushed back harder and weakened. No damage, pure crowd control.
+          '''
+
+          [[dependencies.holycross]]
+              modId="forge"
+              mandatory=true
+              versionRange="[47,)"
+              ordering="NONE"
+              side="BOTH"
+
+          [[dependencies.holycross]]
+              modId="minecraft"
+              mandatory=true
+              versionRange="[1.20.1,1.21)"
+              ordering="NONE"
+              side="BOTH"
+          HC_EOF_7Q
+          cat > src/main/resources/assets/holycross/lang/en_us.json <<'HC_EOF_7Q'
+          {
+            "item.holycross.holy_cross": "Cross of Light",
+            "item.holycross.holy_cross.desc": "Right-click to repel nearby mobs. Undead are pushed back harder and weakened."
+          }
+          HC_EOF_7Q
+          cat > src/main/resources/assets/holycross/lang/ru_ru.json <<'HC_EOF_7Q'
+          {
+            "item.holycross.holy_cross": "Крест Света",
+            "item.holycross.holy_cross.desc": "ПКМ — отпугнуть мобов поблизости. Нежить отбрасывает сильнее и ослабляет."
+          }
+          HC_EOF_7Q
+          cat > src/main/resources/assets/holycross/models/item/holy_cross.json <<'HC_EOF_7Q'
+          {
+            "parent": "minecraft:item/handheld",
+            "textures": {
+              "layer0": "holycross:item/holy_cross"
+            }
+          }
+          HC_EOF_7Q
+          base64 -d > src/main/resources/assets/holycross/textures/item/holy_cross.png <<'HC_EOF_7Q'
+          iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAADwUlEQVR4nL2X3W8bRRTFf7O7s/ba
+          a6+/EsdJS4napGoJEbSA1AokhMT/DRJCKuKFR6o2qdK4TePYiT/2e2eGh4oHSETJgHJfd+fcc8+5
+          e/eOwDK+2O6bzaiOAaZJyc/PT4UNjmNzaHejbVxhSIqSoqrQqmKrGxgbLM/m0EfDDo8/3UF6Hocv
+          XrDe9xj2S8a/HFwby0q2L++uGaUUniNQSpOWFYtMcTxLro1nZUGal0R1j6f3umx26mx1Ahy7WuwI
+          FMpQaU2pNNJzcF0HbZXekoAxoA0s0oookGitMVj1oF0TAmSlIskVjqPJSoOxy2+nwMb6gFrQJCkU
+          s7ggqQx3b43+PwL7H6+ZnVtr5uv9u1fWlWQFT598RSIC5plmONxAG82jna1L73/z2X2ztz0ym/3o
+          SqxLrbuz2TENF6LegLDuo5MZw6iG1obJsmCyzFlkis3RiO+/fcKPPz2j0obXx2NudwN6oaQX1hAC
+          jqcpbjggTjPi+RSFy68Hk7/kvNQDNTRhTdJth/hBwMHJG5ZpSdSQtOoueSlxheDlqyOcHwzDXsRv
+          v79kd71BK5AE0mU8S4nziqxUPNgeoN5NyB3BKqs+bEEr8Bh16lzM56A1UUNyZ9Dgdq9BP6zRqruU
+          SvPdk0fkleLF67fsbt/m3apikZa0Ao/7o5Bb3TpRIKlJj1Uc0w996tL9sAV7W5ExRhM0W7SaDYrV
+          DBDUpMMyqziPS/Y/ecD0YsHJ2zEOglanC8DkbEo78Gj6LlFDssor2v0NDo9PESonKTWHk5X4RwIA
+          g3Zg1qMmGoGDYS2USNchyStK4eJKn5N3E/a2WpzOM8YXGb1OB9AEUhBKDxw4X5W4tYCz83NWWcXZ
+          4vKovnIOnC1ScbZIr3oEwL1h2/SakrDuEecS18lZxite/a26fxNWc8ARgm7DZ3fUptf06TV9hOUk
+          siLwZyRZSVFpokAixA3+jBwBudKcLguyUuF7DuYmFdAGKmUYz1J6YY2kUFbJrQkgoFV/37/twCPw
+          XcxN7gMOMGj5lErjuwLpOWh9wxYUpUa6DpU2JLmybmdrCxDQbUqy8v1mZGeA5UJijMFzHNKiwhWK
+          Shnrz9CSAJzMM6QjKJWhUDe8ET3e2yHRkmlc8OYio9UK+Xz3jhUBKwXGkwv2H+zw8OEuR6+OeH5w
+          xOHbqRUBK+OGUcOMohqFMkgHkqJiFldMV9m18awUkK7g/rDJySJnEPqcrQqWWWwDZT+I4qJiEPoA
+          pP9hFFspcDSLRaPmmbWWzzwtiXPFyfz690KAPwBEKqtcEA7C6wAAAABJRU5ErkJggg==
+          HC_EOF_7Q
+          cat > src/main/resources/data/holycross/advancements/recipes/tools/holy_cross.json <<'HC_EOF_7Q'
+          {
+            "parent": "minecraft:recipes/root",
+            "criteria": {
+              "has_iron_nugget": {
+                "trigger": "minecraft:inventory_changed",
+                "conditions": {
+                  "items": [ { "items": [ "minecraft:iron_nugget" ] } ]
+                }
+              },
+              "has_the_recipe": {
+                "trigger": "minecraft:recipe_unlocked",
+                "conditions": { "recipe": "holycross:holy_cross" }
+              }
+            },
+            "requirements": [
+              [ "has_the_recipe", "has_iron_nugget" ]
+            ],
+            "rewards": {
+              "recipes": [ "holycross:holy_cross" ]
+            }
+          }
+          HC_EOF_7Q
+          cat > src/main/resources/data/holycross/recipes/holy_cross.json <<'HC_EOF_7Q'
+          {
+            "type": "minecraft:crafting_shaped",
+            "category": "equipment",
+            "pattern": [
+              "S",
+              "N",
+              "S"
+            ],
+            "key": {
+              "S": { "item": "minecraft:stick" },
+              "N": { "item": "minecraft:iron_nugget" }
+            },
+            "result": {
+              "item": "holycross:holy_cross"
+            }
+          }
+          HC_EOF_7Q
+          cat > src/main/resources/data/holycross/tags/entity_types/cross_immune.json <<'HC_EOF_7Q'
+          {
+            "replace": false,
+            "values": []
+          }
+          HC_EOF_7Q
+
+      - name: Build
+        run: gradle build
+
+      - name: Upload jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: holycross-mod
+          path: build/libs/holycross-*.jar
